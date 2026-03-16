@@ -1,0 +1,281 @@
+#!/usr/bin/env node
+/**
+ * openclaw-claude-proxy setup
+ *
+ * Automatically configures OpenClaw to use Claude CLI as a model provider.
+ * Run: node setup.mjs [--port 3456] [--default-model opus|sonnet|haiku] [--dry-run]
+ *
+ * What it does:
+ *   1. Verifies claude CLI is installed and authenticated
+ *   2. Patches openclaw.json — adds claude-local provider + models
+ *   3. Patches auth-profiles.json — adds dummy auth entry
+ *   4. Creates start.sh for easy launch
+ *   5. Optionally starts the proxy
+ */
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { join, dirname } from "node:path";
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const HOME = homedir();
+const OPENCLAW_DIR = process.env.OPENCLAW_STATE_DIR || join(HOME, ".openclaw");
+const CONFIG_PATH = join(OPENCLAW_DIR, "openclaw.json");
+
+// ── Parse args ──────────────────────────────────────────────────────────
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(`--${name}`);
+const opt = (name, fallback) => {
+  const i = args.indexOf(`--${name}`);
+  return i >= 0 && args[i + 1] ? args[i + 1] : fallback;
+};
+
+const PORT = parseInt(opt("port", "3456"), 10);
+const DEFAULT_MODEL = opt("default-model", "opus"); // opus | sonnet | haiku
+const DRY_RUN = flag("dry-run");
+const SKIP_START = flag("no-start");
+const PROVIDER_NAME = opt("provider-name", "claude-local");
+
+const MODEL_ID_MAP = {
+  opus: "claude-opus-4-6",
+  sonnet: "claude-sonnet-4-6",
+  haiku: "claude-haiku-4",
+};
+const DEFAULT_MODEL_ID = MODEL_ID_MAP[DEFAULT_MODEL] || MODEL_ID_MAP.opus;
+
+// ── Models to register ──────────────────────────────────────────────────
+const MODELS = [
+  {
+    id: "claude-opus-4-6",
+    name: "Claude Opus 4.6 (via CLI)",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200000,
+    maxTokens: 16384,
+  },
+  {
+    id: "claude-sonnet-4-6",
+    name: "Claude Sonnet 4.6 (via CLI)",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200000,
+    maxTokens: 16384,
+  },
+  {
+    id: "claude-haiku-4",
+    name: "Claude Haiku 4 (via CLI)",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200000,
+    maxTokens: 8192,
+  },
+];
+
+const MODEL_ALIASES = {
+  [`${PROVIDER_NAME}/claude-opus-4-6`]: { alias: "Claude Opus 4.6" },
+  [`${PROVIDER_NAME}/claude-sonnet-4-6`]: { alias: "Claude Sonnet 4.6" },
+  [`${PROVIDER_NAME}/claude-haiku-4`]: { alias: "Claude Haiku 4" },
+};
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+function log(msg) { console.log(`  ✓ ${msg}`); }
+function warn(msg) { console.log(`  ⚠ ${msg}`); }
+function fail(msg) { console.error(`  ✗ ${msg}`); process.exit(1); }
+
+function readJSON(path) {
+  return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+function writeJSON(path, data) {
+  if (DRY_RUN) {
+    console.log(`  [dry-run] would write ${path}`);
+    return;
+  }
+  writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
+}
+
+// ── Step 1: Verify prerequisites ────────────────────────────────────────
+console.log("\n🔍 Checking prerequisites...\n");
+
+// Check node version
+const nodeVer = parseInt(process.versions.node.split(".")[0], 10);
+if (nodeVer < 18) fail(`Node.js >= 18 required (found ${process.versions.node})`);
+log(`Node.js ${process.versions.node}`);
+
+// Check claude CLI
+try {
+  const ver = execSync("claude --version 2>/dev/null", { encoding: "utf-8" }).trim();
+  log(`Claude CLI: ${ver}`);
+} catch {
+  fail("Claude CLI not found. Install: https://docs.anthropic.com/en/docs/claude-code");
+}
+
+// Check claude auth (quick test)
+try {
+  const out = execSync('claude -p --output-format text --no-session-persistence -- "ping"', {
+    encoding: "utf-8",
+    timeout: 30000,
+    env: { ...process.env, CLAUDECODE: undefined },
+  }).trim();
+  if (out.length > 0) {
+    log(`Claude CLI authenticated (test response: "${out.slice(0, 40)}...")`);
+  }
+} catch (e) {
+  warn(`Claude CLI auth test failed: ${e.message.slice(0, 100)}`);
+  warn("Make sure you're logged in: claude login");
+}
+
+// Check openclaw config
+if (!existsSync(CONFIG_PATH)) fail(`OpenClaw config not found at ${CONFIG_PATH}`);
+log(`OpenClaw config: ${CONFIG_PATH}`);
+
+// ── Step 2: Patch openclaw.json ─────────────────────────────────────────
+console.log("\n📝 Configuring OpenClaw...\n");
+
+const config = readJSON(CONFIG_PATH);
+
+// Ensure models.providers exists
+if (!config.models) config.models = {};
+if (!config.models.providers) config.models.providers = {};
+
+// Add/update claude-local provider
+config.models.providers[PROVIDER_NAME] = {
+  baseUrl: `http://127.0.0.1:${PORT}/v1`,
+  api: "openai-completions",
+  authHeader: false,
+  models: MODELS,
+};
+log(`Provider "${PROVIDER_NAME}" → http://127.0.0.1:${PORT}/v1`);
+
+// Ensure auth profile in config
+if (!config.auth) config.auth = {};
+if (!config.auth.profiles) config.auth.profiles = {};
+config.auth.profiles[`${PROVIDER_NAME}:default`] = {
+  provider: PROVIDER_NAME,
+  mode: "api_key",
+};
+log(`Auth profile "${PROVIDER_NAME}:default" registered`);
+
+// Add models to agents.defaults.models
+if (!config.agents) config.agents = {};
+if (!config.agents.defaults) config.agents.defaults = {};
+if (!config.agents.defaults.models) config.agents.defaults.models = {};
+for (const [key, val] of Object.entries(MODEL_ALIASES)) {
+  config.agents.defaults.models[key] = val;
+}
+log(`Model aliases added to agents.defaults.models`);
+
+writeJSON(CONFIG_PATH, config);
+log(`Config saved`);
+
+// ── Step 3: Patch auth-profiles.json ────────────────────────────────────
+console.log("\n🔑 Configuring auth profiles...\n");
+
+// Find all agent auth-profiles.json files
+const agentsDir = join(OPENCLAW_DIR, "agents");
+const agentDirs = existsSync(agentsDir)
+  ? readdirSync(agentsDir).filter((d) => {
+      const ap = join(agentsDir, d, "agent", "auth-profiles.json");
+      return existsSync(ap);
+    })
+  : [];
+
+import { readdirSync } from "node:fs";
+
+for (const agentId of agentDirs) {
+  const apPath = join(agentsDir, agentId, "agent", "auth-profiles.json");
+  try {
+    const ap = readJSON(apPath);
+    if (!ap.profiles) ap.profiles = {};
+
+    // Add claude-local profile if missing
+    if (!ap.profiles[`${PROVIDER_NAME}:default`]) {
+      ap.profiles[`${PROVIDER_NAME}:default`] = {
+        type: "api_key",
+        provider: PROVIDER_NAME,
+        key: "local-proxy-no-auth",
+      };
+    }
+
+    // Add to lastGood if missing
+    if (!ap.lastGood) ap.lastGood = {};
+    if (!ap.lastGood[PROVIDER_NAME]) {
+      ap.lastGood[PROVIDER_NAME] = `${PROVIDER_NAME}:default`;
+    }
+
+    writeJSON(apPath, ap);
+    log(`Agent "${agentId}" auth profile updated`);
+  } catch (e) {
+    warn(`Skipped agent "${agentId}": ${e.message}`);
+  }
+}
+
+if (agentDirs.length === 0) {
+  warn("No agent auth-profiles.json found — you may need to restart the gateway first");
+}
+
+// ── Step 4: Create start.sh ─────────────────────────────────────────────
+console.log("\n🚀 Creating launcher...\n");
+
+const serverPath = join(__dirname, "server.mjs");
+const logDir = join(OPENCLAW_DIR, "logs");
+if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
+
+const startSh = `#!/bin/bash
+# Start openclaw-claude-proxy if not already running
+PORT=\${CLAUDE_PROXY_PORT:-${PORT}}
+if ! lsof -i :\$PORT -sTCP:LISTEN &>/dev/null; then
+  unset CLAUDECODE
+  nohup node "${serverPath}" \\
+    >> "${logDir}/claude-proxy.log" \\
+    2>> "${logDir}/claude-proxy.err.log" &
+  echo "claude-proxy started on port \$PORT (pid $!)"
+else
+  echo "claude-proxy already running on port \$PORT"
+fi
+`;
+
+const startPath = join(__dirname, "start.sh");
+if (!DRY_RUN) {
+  writeFileSync(startPath, startSh);
+  execSync(`chmod +x "${startPath}"`);
+}
+log(`Launcher: ${startPath}`);
+
+// ── Step 5: Summary ─────────────────────────────────────────────────────
+console.log(`
+╔══════════════════════════════════════════════════════════════╗
+║                  Setup complete!                             ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  Provider: ${PROVIDER_NAME.padEnd(44)}║
+║  Port:     ${String(PORT).padEnd(44)}║
+║  Models:   claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4║
+║  Default:  ${DEFAULT_MODEL_ID.padEnd(44)}║
+║                                                              ║
+║  Start proxy:                                                ║
+║    bash ${startPath.replace(HOME, "~").padEnd(50)}║
+║                                                              ║
+║  Or directly:                                                ║
+║    node ${serverPath.replace(HOME, "~").padEnd(49)}║
+║                                                              ║
+║  Set as default model in openclaw.json:                      ║
+║    agents.defaults.model.primary =                           ║
+║      "${PROVIDER_NAME}/${DEFAULT_MODEL_ID}"${" ".repeat(Math.max(0, 30 - PROVIDER_NAME.length - DEFAULT_MODEL_ID.length))}║
+║                                                              ║
+║  Then restart gateway:                                       ║
+║    openclaw gateway restart                                  ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+`);
+
+// ── Step 6: Optionally start ────────────────────────────────────────────
+if (!SKIP_START && !DRY_RUN) {
+  try {
+    execSync(`bash "${startPath}"`, { stdio: "inherit" });
+  } catch { /* ignore */ }
+}
