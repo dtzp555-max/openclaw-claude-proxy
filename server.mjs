@@ -47,7 +47,13 @@ function callClaude(model, messages) {
       .join("\n\n");
 
     const cliModel = MODEL_MAP[model] || model;
-    const args = ["-p", "--model", cliModel, "--output-format", "text", "--no-session-persistence", "--", prompt];
+    const args = [
+      "-p", "--model", cliModel,
+      "--output-format", "text",
+      "--no-session-persistence",
+      "--allowedTools", "Bash", "Read", "Write", "Edit", "Glob", "Grep",
+      "--", prompt,
+    ];
     const env = { ...process.env };
     delete env.CLAUDECODE;
 
