@@ -119,7 +119,7 @@ try {
   const out = execSync('claude -p --output-format text --no-session-persistence -- "ping"', {
     encoding: "utf-8",
     timeout: 30000,
-    env: { ...process.env, CLAUDECODE: undefined },
+    env: { ...process.env, CLAUDECODE: undefined, ANTHROPIC_API_KEY: undefined, ANTHROPIC_BASE_URL: undefined, ANTHROPIC_AUTH_TOKEN: undefined },
   }).trim();
   if (out.length > 0) {
     log(`Claude CLI authenticated (test response: "${out.slice(0, 40)}...")`);

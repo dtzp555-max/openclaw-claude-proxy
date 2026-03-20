@@ -1,11 +1,12 @@
 #!/bin/bash
-# Start claude-proxy if not already running
-if ! lsof -i :3456 -sTCP:LISTEN &>/dev/null; then
+# Start openclaw-claude-proxy if not already running
+PORT=${CLAUDE_PROXY_PORT:-3456}
+if ! lsof -i :$PORT -sTCP:LISTEN &>/dev/null; then
   unset CLAUDECODE
-  nohup /opt/homebrew/bin/node /Users/taodeng/.openclaw/projects/claude-proxy/server.mjs \
-    >> ~/.openclaw/logs/claude-proxy.log \
-    2>> ~/.openclaw/logs/claude-proxy.err.log &
-  echo "claude-proxy started (pid $!)"
+  nohup node "/Users/taodeng/.openclaw/projects/claude-proxy/openclaw-claude-proxy/server.mjs" \
+    >> "/Users/taodeng/.openclaw/logs/claude-proxy.log" \
+    2>> "/Users/taodeng/.openclaw/logs/claude-proxy.err.log" &
+  echo "claude-proxy started on port $PORT (pid $!)"
 else
-  echo "claude-proxy already running"
+  echo "claude-proxy already running on port $PORT"
 fi

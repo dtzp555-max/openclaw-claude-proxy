@@ -128,6 +128,14 @@ openclaw gateway restart
 | `claude-haiku-4` | haiku | Fastest, lightweight |
 
 ## Authentication
+The proxy supports optional Bearer token authentication via the `PROXY_API_KEY` environment variable.
+
+**When `PROXY_API_KEY` is set**, all requests (except `GET /health`) must include a valid `Authorization: Bearer <token>` header. Requests with a missing or invalid token receive a `401 Unauthorized` response.
+
+**When `PROXY_API_KEY` is not set**, authentication is disabled and all requests are accepted (backwards compatible with v1.6.x and earlier).
+
+For local Claude Max / OAuth usage, avoid exporting `ANTHROPIC_API_KEY` globally into the shell that launches the proxy. `v1.7.1` also sanitizes `ANTHROPIC_*` variables before spawning Claude subprocesses to reduce accidental auth-path pollution.
+
 
 The proxy supports optional Bearer token authentication via the `PROXY_API_KEY` environment variable.
 

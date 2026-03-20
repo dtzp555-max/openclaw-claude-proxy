@@ -78,6 +78,9 @@ const poolBackoff = new Map(); // model → { failures: number, timer: TimeoutId
 function spawnWarm(cliModel) {
   const env = { ...process.env };
   delete env.CLAUDECODE;
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_BASE_URL;
+  delete env.ANTHROPIC_AUTH_TOKEN;
 
   const proc = spawn(CLAUDE, [
     "-p", "--model", cliModel,
@@ -276,6 +279,9 @@ function callClaude(model, messages) {
       console.log(`[pool] no warm process for model=${cliModel}, cold starting...`);
       const env = { ...process.env };
       delete env.CLAUDECODE;
+      delete env.ANTHROPIC_API_KEY;
+      delete env.ANTHROPIC_BASE_URL;
+      delete env.ANTHROPIC_AUTH_TOKEN;
       proc = spawn(CLAUDE, [
         "-p", "--model", cliModel,
         "--output-format", "text",
@@ -390,6 +396,10 @@ async function handleChatCompletions(req, res) {
     }
   } catch (err) {
     console.error(`[proxy] error: ${err.message}`);
+    if (res.headersSent || res.writableEnded || res.destroyed) {
+      try { res.end(); } catch {}
+      return;
+    }
     jsonResponse(res, 500, { error: { message: err.message, type: "proxy_error" } });
   }
 }
