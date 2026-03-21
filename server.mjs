@@ -591,7 +591,7 @@ function completionResponse(res, id, model, content) {
 }
 
 // ── Handle chat completions ─────────────────────────────────────────────
-const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
+const MAX_BODY_SIZE = 5 * 1024 * 1024; // 5 MB
 
 // Set of all valid model identifiers (canonical IDs + aliases)
 const VALID_MODELS = new Set(Object.keys(MODEL_MAP));
@@ -601,7 +601,7 @@ async function handleChatCompletions(req, res) {
   for await (const chunk of req) {
     body += chunk;
     if (body.length > MAX_BODY_SIZE) {
-      return jsonResponse(res, 413, { error: { message: "Request body too large (max 10MB)", type: "invalid_request_error" } });
+      return jsonResponse(res, 413, { error: { message: "Request body too large (max 5MB)", type: "invalid_request_error" } });
     }
   }
 
@@ -645,7 +645,10 @@ async function handleChatCompletions(req, res) {
 
 // ── HTTP server ─────────────────────────────────────────────────────────
 const server = createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "http://127.0.0.1");
+  // Dynamic CORS: only allow localhost origins
+  const origin = req.headers["origin"] || "";
+  const isLocalhost = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin);
+  res.setHeader("Access-Control-Allow-Origin", isLocalhost ? origin : `http://127.0.0.1:${PORT}`);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
