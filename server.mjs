@@ -288,110 +288,148 @@ function computeFirstByteTimeout(cliModel, promptLength) {
   return Math.min(timeout, Math.max(TIMEOUT - 5000, 10000));
 }
 
-// ── Call claude CLI ─────────────────────────────────────────────────────
+// ── Spawn claude CLI (shared setup) ─────────────────────────────────────
+// Resolves session logic, builds CLI args, spawns the process, and sets up
+// timeouts. Returns context object or throws synchronously.
+function spawnClaudeProcess(model, messages, conversationId) {
+  if (stats.activeRequests >= MAX_CONCURRENT) {
+    throw new Error(`concurrency limit reached (${stats.activeRequests}/${MAX_CONCURRENT})`);
+  }
+
+  const cliModel = MODEL_MAP[model] || model;
+
+  // Circuit breaker check: fail fast if model is in open state
+  const breaker = getBreakerState(cliModel);
+  if (breaker.state === "open") {
+    const remainingMs = BREAKER_COOLDOWN - (Date.now() - breaker.openedAt);
+    logEvent("warn", "breaker_rejected", { model: cliModel, remainingCooldownMs: remainingMs });
+    throw new Error(`circuit breaker open for ${cliModel}: ${breaker.failures} consecutive timeouts, retry in ${Math.ceil(remainingMs / 1000)}s`);
+  }
+
+  stats.activeRequests++;
+  stats.totalRequests++;
+
+  let sessionInfo = null;
+  let prompt;
+
+  // ── Session logic ──
+  if (conversationId && sessions.has(conversationId)) {
+    const session = sessions.get(conversationId);
+    session.lastUsed = Date.now();
+    sessionInfo = { uuid: session.uuid, resume: true };
+    stats.sessionHits++;
+
+    const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+    prompt = lastUserMsg
+      ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
+      : "";
+    session.messageCount = messages.length;
+
+    console.log(`[session] resume conv=${conversationId.slice(0, 12)}... uuid=${session.uuid.slice(0, 8)}... msgs=${messages.length} prompt_chars=${prompt.length}`);
+
+  } else if (conversationId) {
+    const uuid = randomUUID();
+    sessions.set(conversationId, { uuid, messageCount: messages.length, lastUsed: Date.now(), model: cliModel });
+    sessionInfo = { uuid, resume: false };
+    stats.sessionMisses++;
+    prompt = messagesToPrompt(messages);
+
+    console.log(`[session] new conv=${conversationId.slice(0, 12)}... uuid=${uuid.slice(0, 8)}... msgs=${messages.length}`);
+
+  } else {
+    stats.oneOffRequests++;
+    prompt = messagesToPrompt(messages);
+  }
+
+  const cliArgs = buildCliArgs(cliModel, sessionInfo);
+
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_BASE_URL;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+
+  const proc = spawn(CLAUDE, cliArgs, { env, stdio: ["pipe", "pipe", "pipe"] });
+  activeProcesses.add(proc);
+
+  const t0 = Date.now();
+  const firstByteTimeoutMs = computeFirstByteTimeout(cliModel, prompt.length);
+  let gotFirstByte = false;
+  let cleaned = false;
+
+  function cleanup() {
+    if (cleaned) return;
+    cleaned = true;
+    clearTimeout(overallTimer);
+    clearTimeout(firstByteTimer);
+    stats.activeRequests--;
+  }
+
+  function handleSessionFailure() {
+    if (sessionInfo?.resume && conversationId) {
+      console.warn(`[session] resume failed for ${conversationId.slice(0, 12)}..., removing stale session`);
+      sessions.delete(conversationId);
+    }
+  }
+
+  function markFirstByte() {
+    if (!gotFirstByte) {
+      gotFirstByte = true;
+      clearTimeout(firstByteTimer);
+      console.log(`[claude] first-byte model=${cliModel} elapsed=${Date.now() - t0}ms`);
+    }
+  }
+
+  // Write prompt to stdin immediately
+  proc.stdin.write(prompt);
+  proc.stdin.end();
+
+  logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, firstByteTimeout: firstByteTimeoutMs, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
+
+  // First-byte timeout
+  const firstByteTimer = setTimeout(() => {
+    if (!gotFirstByte && !cleaned) {
+      stats.timeouts++;
+      breakerRecordTimeout(cliModel);
+      logEvent("error", "first_byte_timeout", { model: cliModel, timeoutMs: firstByteTimeoutMs, promptChars: prompt.length });
+      try { proc.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+    }
+  }, firstByteTimeoutMs);
+
+  // Overall request timeout
+  const overallTimer = setTimeout(() => {
+    if (!cleaned) {
+      stats.timeouts++;
+      breakerRecordTimeout(cliModel);
+      logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT });
+      try { proc.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
+    }
+  }, TIMEOUT);
+
+  return { proc, cliModel, conversationId, t0, cleanup, handleSessionFailure, markFirstByte };
+}
+
+// ── Call claude CLI (non-streaming) ─────────────────────────────────────
 // On-demand spawning: each request spawns a fresh `claude -p` process.
 // No pool = no crash loops, no stale workers, no degraded states.
 // Stdin is written immediately so there's no 3s stdin timeout issue.
 function callClaude(model, messages, conversationId) {
   return new Promise((resolve, reject) => {
-    if (stats.activeRequests >= MAX_CONCURRENT) {
-      return reject(new Error(`concurrency limit reached (${stats.activeRequests}/${MAX_CONCURRENT})`));
+    let ctx;
+    try {
+      ctx = spawnClaudeProcess(model, messages, conversationId);
+    } catch (err) {
+      return reject(err);
     }
 
-    const cliModel = MODEL_MAP[model] || model;
-
-    // Circuit breaker check: fail fast if model is in open state
-    const breaker = getBreakerState(cliModel);
-    if (breaker.state === "open") {
-      const remainingMs = BREAKER_COOLDOWN - (Date.now() - breaker.openedAt);
-      logEvent("warn", "breaker_rejected", { model: cliModel, remainingCooldownMs: remainingMs });
-      return reject(new Error(`circuit breaker open for ${cliModel}: ${breaker.failures} consecutive timeouts, retry in ${Math.ceil(remainingMs / 1000)}s`));
-    }
-
-    stats.activeRequests++;
-    stats.totalRequests++;
-
-    let sessionInfo = null;
-    let prompt;
-
-    // ── Session logic ──
-    if (conversationId && sessions.has(conversationId)) {
-      // Resume existing session: only send the latest user message
-      const session = sessions.get(conversationId);
-      session.lastUsed = Date.now();
-      sessionInfo = { uuid: session.uuid, resume: true };
-      stats.sessionHits++;
-
-      const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-      prompt = lastUserMsg
-        ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
-        : "";
-      session.messageCount = messages.length;
-
-      console.log(`[session] resume conv=${conversationId.slice(0, 12)}... uuid=${session.uuid.slice(0, 8)}... msgs=${messages.length} prompt_chars=${prompt.length}`);
-
-    } else if (conversationId) {
-      // New session: send all messages, persist session for future --resume
-      const uuid = randomUUID();
-      sessions.set(conversationId, { uuid, messageCount: messages.length, lastUsed: Date.now(), model: cliModel });
-      sessionInfo = { uuid, resume: false };
-      stats.sessionMisses++;
-      prompt = messagesToPrompt(messages);
-
-      console.log(`[session] new conv=${conversationId.slice(0, 12)}... uuid=${uuid.slice(0, 8)}... msgs=${messages.length}`);
-
-    } else {
-      // One-off request, no session
-      stats.oneOffRequests++;
-      prompt = messagesToPrompt(messages);
-    }
-
-    const cliArgs = buildCliArgs(cliModel, sessionInfo);
-
-    const env = { ...process.env };
-    delete env.CLAUDECODE;
-    delete env.ANTHROPIC_API_KEY;
-    delete env.ANTHROPIC_BASE_URL;
-    delete env.ANTHROPIC_AUTH_TOKEN;
-
-    const proc = spawn(CLAUDE, cliArgs, { env, stdio: ["pipe", "pipe", "pipe"] });
-    activeProcesses.add(proc);
-
+    const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
     let stdout = "";
     let stderr = "";
-    const t0 = Date.now();
-    const firstByteTimeoutMs = computeFirstByteTimeout(cliModel, prompt.length);
-    let settled = false;
-    let gotFirstByte = false;
-
-    function settle(err, result) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      clearTimeout(firstByteTimer);
-      stats.activeRequests--;
-
-      if (err) {
-        trackError(err.message || String(err));
-
-        // If session resume failed, remove session so next request starts fresh
-        if (sessionInfo?.resume && conversationId) {
-          console.warn(`[session] resume failed for ${conversationId.slice(0, 12)}..., removing stale session`);
-          sessions.delete(conversationId);
-        }
-
-        reject(err);
-      } else {
-        resolve(result);
-      }
-    }
 
     proc.stdout.on("data", (d) => {
-      if (!gotFirstByte) {
-        gotFirstByte = true;
-        clearTimeout(firstByteTimer);
-        console.log(`[claude] first-byte model=${cliModel} elapsed=${Date.now() - t0}ms`);
-      }
+      markFirstByte();
       stdout += d;
     });
     proc.stderr.on("data", (d) => (stderr += d));
@@ -399,53 +437,135 @@ function callClaude(model, messages, conversationId) {
     proc.on("close", (code, signal) => {
       activeProcesses.delete(proc);
       const elapsed = Date.now() - t0;
-      if (settled) {
-        logEvent("warn", "late_close", { model: cliModel, code, signal: signal || "none", elapsed });
-        return;
-      }
+      cleanup();
       if (code !== 0) {
         logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
-        settle(new Error(stderr.slice(0, 300) || stdout.slice(0, 300) || `claude exit ${code}`));
+        trackError(stderr.slice(0, 300) || stdout.slice(0, 300) || `claude exit ${code}`);
+        handleSessionFailure();
+        reject(new Error(stderr.slice(0, 300) || stdout.slice(0, 300) || `claude exit ${code}`));
       } else {
         breakerRecordSuccess(cliModel);
-        logEvent("info", "claude_ok", { model: cliModel, chars: stdout.length, elapsed, session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
-        settle(null, stdout.trim());
+        logEvent("info", "claude_ok", { model: cliModel, chars: stdout.length, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
+        resolve(stdout.trim());
       }
     });
 
     proc.on("error", (err) => {
       console.error(`[claude] spawn error: ${err.message}`);
-      settle(err);
+      cleanup();
+      trackError(err.message);
+      handleSessionFailure();
+      reject(err);
     });
+  });
+}
 
-    // Write prompt to stdin immediately — no idle timeout issue
-    proc.stdin.write(prompt);
-    proc.stdin.end();
+// ── Call claude CLI (real streaming) ─────────────────────────────────────
+// Pipes stdout from the claude process directly to SSE chunks as they arrive.
+// Each data chunk becomes a proper SSE event with delta content in real time.
+function callClaudeStreaming(model, messages, conversationId, res) {
+  const id = `chatcmpl-${randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
 
-    logEvent("info", "claude_spawned", { model: cliModel, promptChars: prompt.length, firstByteTimeout: firstByteTimeoutMs, tier: getModelTier(cliModel), session: conversationId ? conversationId.slice(0, 12) + "..." : "none" });
+  let ctx;
+  try {
+    ctx = spawnClaudeProcess(model, messages, conversationId);
+  } catch (err) {
+    return jsonResponse(res, 500, { error: { message: err.message, type: "proxy_error" } });
+  }
 
-    // First-byte timeout: abort early if Claude CLI produces no output
-    const firstByteTimer = setTimeout(() => {
-      if (!gotFirstByte && !settled) {
-        stats.timeouts++;
-        breakerRecordTimeout(cliModel);
-        logEvent("error", "first_byte_timeout", { model: cliModel, timeoutMs: firstByteTimeoutMs, promptChars: prompt.length });
-        try { proc.kill("SIGTERM"); } catch {}
-        setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
-        settle(new Error(`first-byte timeout after ${firstByteTimeoutMs}ms`));
+  const { proc, cliModel, conversationId: convId, t0, cleanup, handleSessionFailure, markFirstByte } = ctx;
+  let stderr = "";
+  let headersSent = false;
+  let totalChars = 0;
+
+  function ensureHeaders() {
+    if (headersSent || res.writableEnded || res.destroyed) return false;
+    headersSent = true;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    });
+    // Send initial role chunk
+    sendSSE(res, {
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+    });
+    return true;
+  }
+
+  proc.stdout.on("data", (d) => {
+    markFirstByte();
+    const text = d.toString();
+    totalChars += text.length;
+
+    if (!ensureHeaders()) return;
+
+    // Stream each chunk as it arrives from the CLI process
+    sendSSE(res, {
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+    });
+  });
+
+  proc.stderr.on("data", (d) => (stderr += d));
+
+  proc.on("close", (code, signal) => {
+    activeProcesses.delete(proc);
+    cleanup();
+    const elapsed = Date.now() - t0;
+
+    if (code !== 0) {
+      logEvent("error", "claude_exit", { model: cliModel, code, signal: signal || "none", elapsed, stderr: stderr.slice(0, 300) });
+      trackError(stderr.slice(0, 300) || `claude exit ${code}`);
+      handleSessionFailure();
+
+      if (!headersSent && !res.writableEnded && !res.destroyed) {
+        // No output was sent yet — return a JSON error
+        jsonResponse(res, 500, { error: { message: stderr.slice(0, 300) || `claude exit ${code}`, type: "proxy_error" } });
+      } else if (!res.writableEnded && !res.destroyed) {
+        // Already streaming — close the stream gracefully
+        sendSSE(res, {
+          id, object: "chat.completion.chunk", created, model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        });
+        res.write("data: [DONE]\n\n");
+        res.end();
       }
-    }, firstByteTimeoutMs);
+    } else {
+      breakerRecordSuccess(cliModel);
+      logEvent("info", "claude_ok", { model: cliModel, chars: totalChars, elapsed, session: convId ? convId.slice(0, 12) + "..." : "none" });
 
-    // Overall request timeout with graceful kill
-    const timer = setTimeout(() => {
-      if (settled) return;
-      stats.timeouts++;
-      breakerRecordTimeout(cliModel);
-      logEvent("error", "request_timeout", { model: cliModel, timeoutMs: TIMEOUT });
+      if (!headersSent) ensureHeaders();
+      if (!res.writableEnded && !res.destroyed) {
+        sendSSE(res, {
+          id, object: "chat.completion.chunk", created, model,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        });
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+    }
+  });
+
+  proc.on("error", (err) => {
+    console.error(`[claude] spawn error: ${err.message}`);
+    cleanup();
+    trackError(err.message);
+    handleSessionFailure();
+    if (!headersSent && !res.writableEnded && !res.destroyed) {
+      jsonResponse(res, 500, { error: { message: err.message, type: "proxy_error" } });
+    } else if (!res.writableEnded && !res.destroyed) {
+      res.end();
+    }
+  });
+
+  // If client disconnects, kill the process to free resources
+  res.on("close", () => {
+    if (!proc.killed) {
       try { proc.kill("SIGTERM"); } catch {}
-      setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
-      settle(new Error(`timeout after ${TIMEOUT}ms`));
-    }, TIMEOUT);
+    }
   });
 }
 
@@ -458,32 +578,6 @@ function jsonResponse(res, status, data) {
 
 function sendSSE(res, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
-}
-
-function streamResponse(res, id, model, content) {
-  if (res.headersSent || res.writableEnded || res.destroyed) return;
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-  });
-  const created = Math.floor(Date.now() / 1000);
-  sendSSE(res, {
-    id, object: "chat.completion.chunk", created, model,
-    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-  });
-  for (let i = 0; i < content.length; i += 500) {
-    sendSSE(res, {
-      id, object: "chat.completion.chunk", created, model,
-      choices: [{ index: 0, delta: { content: content.slice(i, i + 500) }, finish_reason: null }],
-    });
-  }
-  sendSSE(res, {
-    id, object: "chat.completion.chunk", created, model,
-    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-  });
-  res.write("data: [DONE]\n\n");
-  res.end();
 }
 
 function completionResponse(res, id, model, content) {
@@ -528,15 +622,15 @@ async function handleChatCompletions(req, res) {
 
   if (!messages?.length) return jsonResponse(res, 400, { error: "messages required" });
 
+  if (stream) {
+    // Real streaming: pipe stdout from claude process directly as SSE chunks
+    return callClaudeStreaming(model, messages, conversationId, res);
+  }
+
   try {
     const content = await callClaude(model, messages, conversationId);
     const id = `chatcmpl-${randomUUID()}`;
-
-    if (stream) {
-      streamResponse(res, id, model, content);
-    } else {
-      completionResponse(res, id, model, content);
-    }
+    completionResponse(res, id, model, content);
   } catch (err) {
     console.error(`[proxy] error: ${err.message}`);
     if (res.headersSent || res.writableEnded || res.destroyed) {
