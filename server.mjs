@@ -171,7 +171,7 @@ const MODELS = [
 // Enables --resume for multi-turn conversations, reducing token waste.
 const sessions = new Map(); // conversationId → { uuid, messageCount, lastUsed, model }
 
-setInterval(() => {
+const sessionCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
     if (now - s.lastUsed > SESSION_TTL) {
@@ -180,6 +180,9 @@ setInterval(() => {
     }
   }
 }, 60000);
+
+// ── Active child process tracking ────────────────────────────────────────
+const activeProcesses = new Set();
 
 // ── Stats & diagnostics ─────────────────────────────────────────────────
 const stats = {
@@ -220,7 +223,7 @@ async function checkAuth() {
 
 // Check auth on start and every 10 minutes
 checkAuth();
-setInterval(checkAuth, 600000);
+const authCheckInterval = setInterval(checkAuth, 600000);
 
 // ── Build CLI arguments ─────────────────────────────────────────────────
 function buildCliArgs(cliModel, sessionInfo) {
@@ -352,6 +355,7 @@ function callClaude(model, messages, conversationId) {
     delete env.ANTHROPIC_AUTH_TOKEN;
 
     const proc = spawn(CLAUDE, cliArgs, { env, stdio: ["pipe", "pipe", "pipe"] });
+    activeProcesses.add(proc);
 
     let stdout = "";
     let stderr = "";
@@ -393,6 +397,7 @@ function callClaude(model, messages, conversationId) {
     proc.stderr.on("data", (d) => (stderr += d));
 
     proc.on("close", (code, signal) => {
+      activeProcesses.delete(proc);
       const elapsed = Date.now() - t0;
       if (settled) {
         logEvent("warn", "late_close", { model: cliModel, code, signal: signal || "none", elapsed });
@@ -622,6 +627,59 @@ const server = createServer(async (req, res) => {
 
   jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET|DELETE /sessions" });
 });
+
+
+// ── Graceful shutdown ────────────────────────────────────────────────────
+let shuttingDown = false;
+
+function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logEvent("info", "shutdown_start", { signal });
+
+  // 1. Stop accepting new connections
+  server.close(() => {
+    logEvent("info", "shutdown_server_closed", {});
+  });
+
+  // 2. Clear intervals/timers
+  clearInterval(sessionCleanupInterval);
+  clearInterval(authCheckInterval);
+
+  // 3. Kill all active child processes
+  for (const proc of activeProcesses) {
+    try { proc.kill("SIGTERM"); } catch {}
+  }
+
+  // Force-kill any remaining processes after 5s, then exit
+  const forceExitTimer = setTimeout(() => {
+    for (const proc of activeProcesses) {
+      try { proc.kill("SIGKILL"); } catch {}
+    }
+    logEvent("warn", "shutdown_forced", { remainingProcesses: activeProcesses.size });
+    process.exit(1);
+  }, 5000);
+  forceExitTimer.unref();
+
+  // If no active processes, exit immediately
+  if (activeProcesses.size === 0) {
+    logEvent("info", "shutdown_complete", {});
+    process.exit(0);
+  }
+
+  // Wait for active processes to finish
+  const checkDone = setInterval(() => {
+    if (activeProcesses.size === 0) {
+      clearInterval(checkDone);
+      logEvent("info", "shutdown_complete", {});
+      process.exit(0);
+    }
+  }, 200);
+  checkDone.unref();
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // ── Start ───────────────────────────────────────────────────────────────
 server.listen(PORT, "0.0.0.0", () => {
