@@ -28,7 +28,7 @@
  */
 import { createServer } from "node:http";
 import { spawn, execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, accessSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
@@ -497,9 +497,19 @@ function completionResponse(res, id, model, content) {
 }
 
 // ── Handle chat completions ─────────────────────────────────────────────
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10 MB
+
+// Set of all valid model identifiers (canonical IDs + aliases)
+const VALID_MODELS = new Set(Object.keys(MODEL_MAP));
+
 async function handleChatCompletions(req, res) {
   let body = "";
-  for await (const chunk of req) body += chunk;
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > MAX_BODY_SIZE) {
+      return jsonResponse(res, 413, { error: { message: "Request body too large (max 10MB)", type: "invalid_request_error" } });
+    }
+  }
 
   let parsed;
   try { parsed = JSON.parse(body); } catch { return jsonResponse(res, 400, { error: "Invalid JSON" }); }
@@ -507,6 +517,11 @@ async function handleChatCompletions(req, res) {
   const messages = parsed.messages || parsed.input || [{ role: "user", content: parsed.prompt || "" }];
   const model = parsed.model || "claude-sonnet-4-6";
   const stream = parsed.stream;
+
+  // Validate model against known models
+  if (!VALID_MODELS.has(model)) {
+    return jsonResponse(res, 400, { error: { message: `Unknown model: ${model}. Valid models: ${[...VALID_MODELS].join(", ")}`, type: "invalid_request_error" } });
+  }
 
   // Session ID: from request body, header, or null (one-off)
   const conversationId = parsed.session_id || parsed.conversation_id || req.headers["x-session-id"] || req.headers["x-conversation-id"] || null;
@@ -528,13 +543,15 @@ async function handleChatCompletions(req, res) {
       try { res.end(); } catch {}
       return;
     }
-    jsonResponse(res, 500, { error: { message: err.message, type: "proxy_error" } });
+    // Sanitize error: strip internal file paths before sending to client
+    const safeMessage = (err.message || "Internal error").replace(/\/[\w/.\-]+/g, "[path]");
+    jsonResponse(res, 500, { error: { message: safeMessage, type: "proxy_error" } });
   }
 }
 
 // ── HTTP server ─────────────────────────────────────────────────────────
 const server = createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Origin", "http://127.0.0.1");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id, X-Conversation-Id");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
@@ -543,7 +560,9 @@ const server = createServer(async (req, res) => {
   if (PROXY_API_KEY && req.url !== "/health") {
     const auth = req.headers["authorization"] || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    if (token !== PROXY_API_KEY) {
+    const tokenBuf = Buffer.from(token);
+    const keyBuf = Buffer.from(PROXY_API_KEY);
+    if (tokenBuf.length !== keyBuf.length || !timingSafeEqual(tokenBuf, keyBuf)) {
       return jsonResponse(res, 401, { error: { message: "Unauthorized: invalid or missing Bearer token", type: "auth_error" } });
     }
   }
@@ -620,11 +639,6 @@ const server = createServer(async (req, res) => {
     return jsonResponse(res, 200, { sessions: list });
   }
 
-  // Catch-all POST
-  if (req.method === "POST") {
-    return handleChatCompletions(req, res);
-  }
-
   jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET|DELETE /sessions" });
 });
 
@@ -682,8 +696,8 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // ── Start ───────────────────────────────────────────────────────────────
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`openclaw-claude-proxy v${VERSION} listening on http://0.0.0.0:${PORT}`);
+server.listen(PORT, "127.0.0.1", () => {
+  console.log(`openclaw-claude-proxy v${VERSION} listening on http://127.0.0.1:${PORT}`);
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
