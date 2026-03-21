@@ -1,6 +1,6 @@
 {
   "name": "openclaw-claude-proxy",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "OpenAI-compatible proxy for Claude CLI v2 — per-model circuit breaker, adaptive first-byte timeout, structured logging",
   "type": "module",
   "bin": {
