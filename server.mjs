@@ -1,11 +1,17 @@
 #!/usr/bin/env node
 /**
- * openclaw-claude-proxy v2.5.0 — OpenAI-compatible proxy for Claude CLI
+ * OCP (OpenClaw Control Plane) v4.0-alpha
  *
- * Translates OpenAI chat/completions requests into `claude -p` CLI calls,
- * letting you use your Claude Pro/Max subscription as an OpenClaw model provider.
+ * Cost-control and model-routing layer for AI agents.
+ * Currently supports Claude CLI backend; architecture supports multiple backends.
  *
- * v2.5.0:
+ * v4.0-alpha:
+ *   - Internal modular architecture: BackendAdapter, ModelRegistry, AgentRouter,
+ *     SessionManager, StatsCollector
+ *   - External API unchanged from v2.5.0
+ *   - Claude CLI backend extracted to ClaudeCliAdapter
+ *
+ * v2.5.0 (legacy notes):
  *   - Sliding-window circuit breaker: uses time-windowed failure rate instead of
  *     consecutive-count, preventing multi-agent burst scenarios from tripping the
  *     breaker too aggressively. Half-open state allows configurable probe requests.
@@ -46,6 +52,54 @@ import { dirname, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const _pkg = JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8"));
+
+// ── v4 Modular Architecture (Step 1: load + initialize, hot path unchanged) ──
+import { ClaudeCliAdapter } from "./backends/claude-cli.mjs";
+import { ModelRegistry } from "./model-registry.mjs";
+import { AgentRouter } from "./agent-router.mjs";
+import { SessionManager as SessionMgr } from "./session-manager.mjs";
+import { StatsCollector } from "./stats-collector.mjs";
+
+// These modules are initialized at startup but NOT yet wired into the request
+// path. Step 2 will replace the legacy callClaude/callClaudeStreaming with
+// adapter-based calls. For now, they run in parallel for validation.
+let _v4Backend = null;
+let _v4Registry = null;
+let _v4Router = null;
+let _v4Sessions = null;
+let _v4Stats = null;
+
+async function initV4Modules() {
+  try {
+    _v4Stats = new StatsCollector();
+    _v4Sessions = new SessionMgr({ ttl: SESSION_TTL });
+    _v4Registry = new ModelRegistry();
+
+    _v4Backend = new ClaudeCliAdapter({
+      maxConcurrent: MAX_CONCURRENT,
+      timeout: { overall: TIMEOUT },
+      skipPermissions: SKIP_PERMISSIONS,
+      allowedTools: ALLOWED_TOOLS,
+      systemPrompt: SYSTEM_PROMPT,
+      mcpConfig: MCP_CONFIG,
+      timeoutTiers: MODEL_TIMEOUT_TIERS,
+    });
+    await _v4Backend.initialize();
+    _v4Registry.registerBackend(_v4Backend);
+
+    const backends = new Map([["claude-cli", _v4Backend]]);
+    _v4Router = new AgentRouter({
+      registry: _v4Registry,
+      backends,
+      agentConfig: { default: { preferred: "claude-cli", fallback: null } },
+      defaultBackend: "claude-cli",
+    });
+
+    console.log(`[v4] Modules initialized: backend=${_v4Backend.id}, models=${_v4Backend.models.length}, registry=${_v4Registry.listModels().length} models`);
+  } catch (err) {
+    console.error(`[v4] Module init failed (non-fatal, legacy path active): ${err.message}`);
+  }
+}
 
 // ── Resolve claude binary ───────────────────────────────────────────────
 // Priority: CLAUDE_BIN env > well-known paths > which lookup
@@ -1178,7 +1232,36 @@ const server = createServer(async (req, res) => {
     return handleSettings(req, res);
   }
 
-  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions" });
+  // GET /backends — v4 backend status (new endpoint)
+  if (req.url === "/backends" && req.method === "GET") {
+    if (!_v4Backend) {
+      return jsonResponse(res, 503, { error: "v4 modules not initialized" });
+    }
+    const health = await _v4Backend.healthCheck();
+    return jsonResponse(res, 200, {
+      backends: [{
+        id: _v4Backend.id,
+        displayName: _v4Backend.displayName,
+        tier: _v4Backend.tier,
+        costType: _v4Backend.costType,
+        enabled: _v4Backend.enabled,
+        models: _v4Backend.models,
+        activeProcesses: _v4Backend.activeProcessCount,
+        health,
+      }],
+      routing: _v4Router?.getRoutingTable() || {},
+    });
+  }
+
+  // GET /routing — v4 agent routing table (new endpoint)
+  if (req.url === "/routing" && req.method === "GET") {
+    return jsonResponse(res, 200, {
+      table: _v4Router?.getRoutingTable() || {},
+      registry: _v4Registry?.listModels() || [],
+    });
+  }
+
+  jsonResponse(res, 404, { error: "Not found. Endpoints: GET /v1/models, POST /v1/chat/completions, GET /health, GET /usage, GET /status, GET /logs, GET|PATCH /settings, GET|DELETE /sessions, GET /backends, GET /routing" });
 });
 
 
@@ -1198,6 +1281,10 @@ function gracefulShutdown(signal) {
   // 2. Clear intervals/timers
   clearInterval(sessionCleanupInterval);
   clearInterval(authCheckInterval);
+
+  // 2b. Shutdown v4 modules
+  if (_v4Sessions) _v4Sessions.shutdown();
+  if (_v4Backend) _v4Backend.shutdown().catch(() => {});
 
   // 3. Kill all active child processes
   for (const proc of activeProcesses) {
@@ -1235,8 +1322,11 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
 // ── Start ───────────────────────────────────────────────────────────────
+// Initialize v4 modules before listening
+initV4Modules().catch(err => console.error(`[v4] init error: ${err.message}`));
+
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`openclaw-claude-proxy v${VERSION} listening on http://127.0.0.1:${PORT}`);
+  console.log(`OCP (OpenClaw Control Plane) v${VERSION} listening on http://127.0.0.1:${PORT}`);
   console.log(`Architecture: on-demand spawning (no pool)`);
   console.log(`Models: ${MODELS.map((m) => m.id).join(", ")}`);
   console.log(`Claude binary: ${CLAUDE}`);
