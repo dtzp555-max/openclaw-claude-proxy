@@ -1,6 +1,6 @@
 {
   "name": "openclaw-claude-proxy",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "OpenAI-compatible proxy for Claude CLI — plan usage monitoring, runtime settings, prompt truncation, OCP CLI",
   "type": "module",
   "bin": {
@@ -24,6 +24,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/dtzp555-max/openclaw-claude-proxy"
+    "url": "https://github.com/dtzp555-max/ocp"
   }
 }

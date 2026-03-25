@@ -740,20 +740,57 @@ function completionResponse(res, id, model, content) {
 let usageCache = { data: null, fetchedAt: 0 };
 const USAGE_CACHE_TTL = 300000; // 5 min
 
-function getOAuthToken() {
+function getOAuthCredentials() {
   try {
     const raw = execFileSync("security", [
       "find-generic-password", "-s", "Claude Code-credentials", "-w"
     ], { encoding: "utf8", timeout: 5000 }).trim();
-    const creds = JSON.parse(raw);
-    return creds?.claudeAiOauth?.accessToken || null;
+    return JSON.parse(raw)?.claudeAiOauth || null;
   } catch {
     return null;
   }
 }
 
+async function refreshOAuthToken(_creds) {
+  // Trigger Claude Code to refresh the token by running a minimal command.
+  // Claude Code automatically refreshes expired tokens on startup.
+  try {
+    execFileSync("claude", ["-p", "--model", "haiku", "--max-turns", "1", "hi"], {
+      encoding: "utf8",
+      timeout: 30000,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    // Re-read the now-refreshed token from keychain
+    const refreshed = getOAuthCredentials();
+    if (refreshed?.accessToken && refreshed.expiresAt > Date.now()) {
+      console.log("[ocp] OAuth token refreshed via Claude CLI");
+      return refreshed.accessToken;
+    }
+    return null;
+  } catch (e) {
+    console.error("[ocp] OAuth refresh via CLI failed:", e.message);
+    return null;
+  }
+}
+
+async function getOAuthToken() {
+  const creds = getOAuthCredentials();
+  if (!creds?.accessToken) return null;
+
+  // Check if token is expired or about to expire (5 min buffer)
+  const expiresAt = creds.expiresAt || 0;
+  if (expiresAt > Date.now() + 300000) {
+    return creds.accessToken;
+  }
+
+  // Token expired or expiring soon — try refresh
+  console.log("[ocp] OAuth token expired, attempting refresh...");
+  const newToken = await refreshOAuthToken(creds);
+  return newToken || creds.accessToken; // fallback to old token (might still work briefly)
+}
+
 async function fetchUsageFromApi() {
-  const token = getOAuthToken();
+  const token = await getOAuthToken();
   if (!token) {
     return { error: "No OAuth token found in keychain" };
   }
